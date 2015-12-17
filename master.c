@@ -10,25 +10,35 @@
 #include "common.h"
 
 #define IDX_PER_SLAVE 3
+#define GROUPS_MAX 10
 void usage();
+
+struct group_info {
+	int processes;
+	int shares;
+	float expected_percentage;
+
+} groups[GROUPS_MAX];
+int total_groups = 0;
 int fd;
 int   shmid;
 long  *segptr;
-char group[]="group_XXXXXX";
+char group_prefix[]="group_XXXXXX";
 
 void sigint(int a)
 {
 	char cmd[64];
+	int i;
 	fprintf(stderr, "Exiting...");
 	shmdt(segptr);
 	shmctl(shmid, IPC_RMID, 0);
 	close(fd);
-	sprintf(cmd, "rm -f %s", group);
+	sprintf(cmd, "rm -f %s", group_prefix);
 	system(cmd);
-	sprintf(cmd, "cgdelete -g cpu:/%s_1", group);
-	system(cmd);
-	sprintf(cmd, "cgdelete -g cpu:/%s_2", group);
-	system(cmd);
+	for (i = 0; i < total_groups; i++) {
+		sprintf(cmd, "cgdelete -g cpu:/%s_%d", group_prefix, i);
+		system(cmd);
+	}
 	fprintf(stderr, "done\n");
 	exit(0);
 }
@@ -36,25 +46,24 @@ void sigint(int a)
 int main(int argc, char *argv[])
 {
 	key_t key;
-	int n, m;
-	int i, current, next;
-	long n_sum, m_sum;
+	int i, j, current, next;
+	long group_sum[GROUPS_MAX], total_sum;
 	char arg1[64], arg2[64];
-	char grp1[64], grp2[64];
+	char cmd[64], grp[64];
+	int total_processes = 0;
+	int total_shares = 0;
+	int process_idx = 0;
 
-	if(argc < 2 && argc > 6)
+	if(argc < 3 && argc > 13)
 		usage();
 	if (strcmp(argv[1], "spin") &&
 		strcmp(argv[1], "ebizzy")) {
 		usage();
 	}
-	sscanf(argv[4], "%d", &n);
-	sscanf(argv[5], "%d", &m);
-
 	signal(SIGINT, sigint);
-	fd = mkstemp(group);
+	fd = mkstemp(group_prefix);
 	/* Create unique key via call to ftok() */
-	key = ftok(group, 0);
+	key = ftok(group_prefix, 0);
 
 	/* Open the shared memory segment - create if necessary */
 	if((shmid = shmget(key, SEGSIZE, IPC_CREAT|IPC_EXCL|0666)) == -1) 
@@ -80,59 +89,63 @@ int main(int argc, char *argv[])
 		perror("shmat");
 		exit(1);
 	}
-	memset(segptr, 0, sizeof(long) * ((n+m) * IDX_PER_SLAVE + 1));
+
+	total_groups = argc - 2;
+	for (i = 0; i < total_groups; i++) {
+		sscanf(argv[i + 2], "%d:%d", &groups[i].processes, &groups[i].shares);
+		sprintf(cmd, "cgcreate -g cpu:/%s_%d", group_prefix, i);
+		system(cmd);
+		sprintf(cmd, "cgset -r cpu.shares=%d %s_%d", groups[i].shares, group_prefix, i);
+		system(cmd);
+		total_processes += groups[i].processes;
+		total_shares += groups[i].shares;
+	}
+	for (i = 0; i < total_groups; i++)
+		groups[i].expected_percentage = (float) groups[i].shares * 100 / total_shares;
+
+	memset(segptr, 0, sizeof(long) * (total_processes * IDX_PER_SLAVE + 1));
 	current = 0;
 
 	/* create slaves */
-	sprintf(arg1, "cgcreate -g cpu:/%s_1", group);
-	sprintf(arg2, "cgcreate -g cpu:/%s_2", group);
-	system(arg1);
-	system(arg2);
-
-	sprintf(arg1, "cgset -r cpu.shares=%s %s_1", argv[2], group);
-	sprintf(arg2, "cgset -r cpu.shares=%s %s_2", argv[3], group);
-	system(arg1);
-	system(arg2);
-
-	sprintf(arg2, "%d", n + m);
-	sprintf(grp1, "cpu:%s_1", group);
-	sprintf(grp2, "cpu:%s_2", group);
-	for (i = 0; i < n; i++) {
-		sprintf(arg1, "%d", i + 1);
-		if (!fork()) 
-			if (execlp("cgexec", "cgexec", "-g", grp1, "./slave",
-					group, argv[1], arg1, arg2,
-					NULL) == -1)
-				perror("execlp");
+	sprintf(arg2, "%d", total_processes);
+	for (i = 0; i < total_groups; i++) {
+		sprintf(grp, "cpu:%s_%d", group_prefix, i);
+		for (j = 0; j < groups[i].processes; j++) {
+			sprintf(arg1, "%d", ++process_idx);
+			if (!fork())
+				if (execlp("cgexec", "cgexec", "-g", grp, "./slave",
+							group_prefix, argv[1], arg1, arg2,
+							NULL) == -1)
+					perror("execlp");
+		}
 	}
 
-	for (i = 0; i < m; i++) {
-		sprintf(arg1, "%d", n + i + 1);
-		if (!fork()) 
-			if (execlp("cgexec", "cgexec", "-g", grp2, "./slave",
-					group, argv[1], arg1, arg2,
-					NULL) == -1)
-				perror("execlp");
-	}
-
-
+	/* start the benchmark */
 	while (1) {
 		next = current + 1;
 		if (next == IDX_PER_SLAVE) next = 0;
 		/* clean up old data data in the next indexes */
-		memset(&segptr[1 + (n + m) * next], 0, sizeof(long) * (n+m));
+		memset(&segptr[1 + total_processes * next], 0, sizeof(long) * total_processes);
 		segptr[0] = next;
-		n_sum = m_sum = 0;
-		for (i = 0; i < n; i++) {
-			n_sum += segptr[1 + i + (n+m) * current];
+		memset(group_sum, 0, sizeof(long) * total_groups);
+		process_idx = 0;
+		total_sum = 0;
+		for (i = 0; i < total_groups; i++) {
+			for (j = 0; j < groups[i].processes; j++) {
+				group_sum[i] +=	segptr[1 + process_idx + (total_processes) * current];
+				process_idx++;
+			}
+			total_sum += group_sum[i];
 		}
-		for (i = 0; i < m; i++) {
-			m_sum += segptr[1 + n + i + (n+m) * current];
+
+		for (i = 0; i < total_groups; i++) {
+			float percentage = !group_sum[i] ?  0.0 :
+				(float)group_sum[i] * 100 / total_sum;
+			fprintf(stderr, "%5.1f", percentage);
+			fprintf(stderr, " (%4.1f)   ", percentage - groups[i].expected_percentage);
+
 		}
-		if (n_sum || m_sum)
-			fprintf(stderr, "%ld%% %ld\n",
-				m_sum * 100 / (n_sum + m_sum),
-				(n_sum + m_sum));
+		fprintf(stderr, "%8ld\n", total_sum);
 		current = next;
 		sleep(1);
 
@@ -142,10 +155,9 @@ int main(int argc, char *argv[])
 
 void usage(void)
 {
-	fprintf(stderr, "\nUSAGE:  master wl s1 s2 n m\n");
+	fprintf(stderr, "\nUSAGE: ./master <wl> <n1:s1> [n2:s2] [n3:s3] ...[n10:s10]\n");
 	fprintf(stderr, "\twl - type of workload. Available types: spin, ebizzy\n");
-	fprintf(stderr, "\ts1,s2 - weights of a groups in a cpu.shares\n");
-	fprintf(stderr, "\tn - number of processes in a first group\n");
-	fprintf(stderr, "\tm - number of processes in a second group\n");
+	fprintf(stderr, "\tnX - number of processes in a Xth group\n");
+	fprintf(stderr, "\tsX - weight of Xth group in a cpu.shares\n");
 	exit(1);
 }
