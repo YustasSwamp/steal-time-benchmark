@@ -7,8 +7,13 @@
 #include <string.h>
 #include <unistd.h>
 #include <signal.h>
+#include <math.h>
 #include "common.h"
 
+#define ANSI_COLOR_RED_BOLD	"\x1b[31;1m"
+#define ANSI_COLOR_RED		"\x1b[31m"
+#define ANSI_COLOR_YELLOW	"\x1b[33;5m"
+#define ANSI_COLOR_RESET	"\x1b[0m"
 #define IDX_PER_SLAVE 3
 #define GROUPS_MAX 10
 void usage();
@@ -113,9 +118,15 @@ int main(int argc, char *argv[])
 		for (j = 0; j < groups[i].processes; j++) {
 			sprintf(arg1, "%d", ++process_idx);
 			if (!fork())
+#if 1
 				if (execlp("cgexec", "cgexec", "-g", grp, "./slave",
 							group_prefix, argv[1], arg1, arg2,
 							NULL) == -1)
+#else
+				if (execlp("./slave", "./slave",
+							group_prefix, argv[1], arg1, arg2,
+							NULL) == -1)
+#endif
 					perror("execlp");
 		}
 	}
@@ -141,8 +152,25 @@ int main(int argc, char *argv[])
 		for (i = 0; i < total_groups; i++) {
 			float percentage = !group_sum[i] ?  0.0 :
 				(float)group_sum[i] * 100 / total_sum;
-			fprintf(stderr, "%5.1f", percentage);
-			fprintf(stderr, " (%4.1f)   ", percentage - groups[i].expected_percentage);
+			float delta;
+			if (percentage == 0.0)
+				fprintf(stderr, ANSI_COLOR_RED_BOLD "  0.0 " ANSI_COLOR_RESET);
+			else if (percentage < 0.1)
+				fprintf(stderr, "%6.2f", percentage);
+			else
+				fprintf(stderr, "%5.1f ", percentage);
+			delta = percentage - groups[i].expected_percentage;
+			if (fabs(delta) >= 10.0)
+				fprintf(stderr, "(" ANSI_COLOR_RED_BOLD "%5.1f" ANSI_COLOR_RESET ")  ",
+					percentage - groups[i].expected_percentage);
+			else if (fabs(delta) > 3.0)
+				fprintf(stderr, "(" ANSI_COLOR_RED "%5.1f" ANSI_COLOR_RESET ")  ",
+					percentage - groups[i].expected_percentage);
+			else if (fabs(delta) > 1.5)
+				fprintf(stderr, "(" ANSI_COLOR_YELLOW "%5.1f" ANSI_COLOR_RESET ")  ",
+					percentage - groups[i].expected_percentage);
+			else
+				fprintf(stderr, "(%5.1f)  ", percentage - groups[i].expected_percentage);
 
 		}
 		fprintf(stderr, "%8ld\n", total_sum);
