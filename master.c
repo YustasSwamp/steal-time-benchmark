@@ -59,7 +59,7 @@ int main(int argc, char *argv[])
 	int total_shares = 0;
 	int process_idx = 0;
 
-	if(argc < 3 && argc > 13)
+	if(argc < 3 || argc > 13)
 		usage();
 	if (strcmp(argv[1], "spin") &&
 		strcmp(argv[1], "ebizzy")) {
